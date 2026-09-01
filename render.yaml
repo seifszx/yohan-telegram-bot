@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: yohan-telegram-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: BOT_NAME
+        value: يوهان
