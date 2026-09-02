@@ -1,6 +1,9 @@
 import logging
+import json
+import logging
 import os
 import random
+from pathlib import Path
 from collections import defaultdict
 
 from dotenv import load_dotenv
@@ -334,13 +337,61 @@ KEYWORD_REPLIES.update({
 # حفظ بسيط لعدد الرسائل في كل مجموعة أثناء تشغيل البوت.
 message_counts = defaultdict(int)
 
+# المستخدم الوحيد المسموح له بإضافة ردود مخصصة.
+ADMIN_USER_ID = 8134196484
+CUSTOM_REPLIES_FILE = Path(os.getenv("CUSTOM_REPLIES_FILE", "custom_replies.json"))
+custom_replies: dict[str, dict[str, str]] = {}
+admin_sessions: dict[int, dict[str, str]] = {}
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(text.casefold().strip().split()).strip(" .،,!؟؛:ـ-_")
+
+
+def load_custom_replies() -> None:
+    global custom_replies
+    try:
+        if CUSTOM_REPLIES_FILE.exists():
+            data = json.loads(CUSTOM_REPLIES_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                custom_replies = data
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("تعذر تحميل الردود المخصصة: %s", exc)
+
+
+def save_custom_replies() -> None:
+    CUSTOM_REPLIES_FILE.write_text(
+        json.dumps(custom_replies, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
 
 def choose_reply(text: str) -> str | None:
     # نزيل علامات الترقيم والمسافات الزائدة، ثم نطابق الرسالة كاملةً.
     # لذلك «صفا» يجيب، بينما «اهلا صفا» لا يجيب.
-    normalized = " ".join(text.casefold().strip().split()).strip(" .،,!؟؛:ـ-_")
+    normalized = normalize_text(text)
+    custom = custom_replies.get(normalized)
+    if custom and custom.get("type") == "text":
+        return custom.get("value")
     return KEYWORD_REPLIES.get(normalized)
 
+
+
+async def addreply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user or user.id != ADMIN_USER_ID:
+        return
+    admin_sessions[user.id] = {"stage": "keyword"}
+    await update.effective_message.reply_text(
+        "أرسل الآن الكلمة وحدها، وبعدها سأطلب منك الرد النصي أو الملصق.\n"
+        "للإلغاء أرسل /cancelreply"
+    )
+
+
+async def cancelreply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if user and user.id == ADMIN_USER_ID:
+        admin_sessions.pop(user.id, None)
+        await update.effective_message.reply_text("تم إلغاء إضافة الرد.")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -355,7 +406,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "الأوامر المتاحة:\n"
         "/start — التعريف بالبوت\n"
         "/help — عرض المساعدة\n"
-        "/stats — عدد الرسائل التي شفتها المجموعة أثناء التشغيل"
+        "/stats — عدد الرسائل التي شفتها المجموعة أثناء التشغيل\n"
+        "/addreply — للمسؤول فقط: أرسل كلمة ثم نصًا أو ملصقًا ليصبح ردًا خاصًا\n"
+        "/cancelreply — إلغاء عملية إضافة الرد"
     )
 
 
@@ -369,7 +422,7 @@ async def reply_to_every_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     message = update.effective_message
     chat = update.effective_chat
 
-    if not message or not message.text:
+    if not message:
         return
     if chat and chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP, ChatType.PRIVATE}:
         return
@@ -377,8 +430,40 @@ async def reply_to_every_text(update: Update, context: ContextTypes.DEFAULT_TYPE
     if message.from_user and message.from_user.is_bot:
         return
 
+    user = update.effective_user
+    if user and user.id == ADMIN_USER_ID and user.id in admin_sessions:
+        session = admin_sessions[user.id]
+        if session["stage"] == "keyword":
+            if not message.text or not normalize_text(message.text):
+                await message.reply_text("أرسل كلمة نصية وحدها، أو أرسل /cancelreply للإلغاء.")
+                return
+            session["keyword"] = normalize_text(message.text)
+            session["stage"] = "response"
+            await message.reply_text("مليح. أرسل الآن الرد النصي أو الملصق.")
+            return
+        if session["stage"] == "response":
+            keyword = session["keyword"]
+            if message.sticker:
+                custom_replies[keyword] = {"type": "sticker", "value": message.sticker.file_id}
+            elif message.text:
+                custom_replies[keyword] = {"type": "text", "value": message.text}
+            else:
+                await message.reply_text("أرسل نصًا أو ملصقًا فقط، أو أرسل /cancelreply للإلغاء.")
+                return
+            save_custom_replies()
+            admin_sessions.pop(user.id, None)
+            await message.reply_text(f"تم حفظ الرد للكلمة: {keyword}")
+            return
+
+    if not message.text:
+        return
     reply = choose_reply(message.text)
     if reply is None:
+        custom = custom_replies.get(normalize_text(message.text))
+        if not custom or custom.get("type") != "sticker":
+            return
+        message_counts[chat.id] += 1
+        await message.reply_sticker(custom["value"])
         return
 
     message_counts[chat.id] += 1
@@ -394,7 +479,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply_to_every_text))
+    app.add_handler(CommandHandler("addreply", addreply))
+    app.add_handler(CommandHandler("cancelreply", cancelreply))
+    app.add_handler(MessageHandler((filters.TEXT | filters.Sticker) & ~filters.COMMAND, reply_to_every_text))
+    load_custom_replies()
     app.add_error_handler(error_handler)
     logger.info("يوهان يعمل الآن.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
